@@ -1,30 +1,38 @@
 
-from flask import Flask, jsonify, request
-from datetime import datetime, timezone
-from pathlib import Path
-import json
+import os
 import uuid
+from datetime import datetime, timezone
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-ARCHIVO = Path(r"C:\BARBOSA_SERVER\config\jugadores.json")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-def cargar_jugadores():
-    if not ARCHIVO.exists():
-        return []
-    try:
-        return json.loads(ARCHIVO.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
+def conectar():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no configurada")
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 
-def guardar_jugadores(jugadores):
-    ARCHIVO.parent.mkdir(parents=True, exist_ok=True)
-    ARCHIVO.write_text(
-        json.dumps(jugadores, ensure_ascii=False, indent=4),
-        encoding="utf-8"
-    )
+def inicializar_base_datos():
+    with conectar() as conexion:
+        with conexion.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS jugadores (
+                    id TEXT PRIMARY KEY,
+                    nombre VARCHAR(20) NOT NULL,
+                    fecha TIMESTAMPTZ NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                jugadores_nombre_lower_idx
+                ON jugadores (LOWER(nombre))
+            """)
 
 
 @app.route("/")
@@ -33,7 +41,7 @@ def inicio():
         "servidor": "BARBOSA SERVER",
         "version": "1.53.2",
         "estado": "ONLINE",
-        "modo": "LOCAL"
+        "modo": "POSTGRESQL"
     })
 
 
@@ -48,10 +56,33 @@ def estado():
 
 @app.route("/jugadores", methods=["GET"])
 def listar_jugadores():
-    return jsonify({
-        "total": len(cargar_jugadores()),
-        "jugadores": cargar_jugadores()
-    })
+    try:
+        with conectar() as conexion:
+            with conexion.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT id, nombre, fecha
+                    FROM jugadores
+                    ORDER BY fecha
+                """)
+                filas = cursor.fetchall()
+
+        jugadores = [
+            {
+                "id": fila["id"],
+                "nombre": fila["nombre"],
+                "fecha": fila["fecha"].isoformat()
+            }
+            for fila in filas
+        ]
+
+        return jsonify({
+            "total": len(jugadores),
+            "jugadores": jugadores
+        })
+
+    except Exception:
+        app.logger.exception("Error consultando jugadores")
+        return jsonify({"error": "Error de base de datos"}), 500
 
 
 @app.route("/registro", methods=["POST"])
@@ -64,26 +95,39 @@ def registrar_jugador():
             "error": "El nombre debe tener entre 1 y 20 caracteres"
         }), 400
 
-    jugadores = cargar_jugadores()
+    jugador_id = str(uuid.uuid4())
+    fecha = datetime.now(timezone.utc)
 
-    if any(j["nombre"].lower() == nombre.lower() for j in jugadores):
-        return jsonify({"error": "Ese nombre ya está registrado"}), 409
+    try:
+        with conectar() as conexion:
+            with conexion.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO jugadores (id, nombre, fecha)
+                    VALUES (%s, %s, %s)
+                """, (jugador_id, nombre, fecha))
 
-    jugador = {
-        "id": str(uuid.uuid4()),
-        "nombre": nombre,
-        "fecha": datetime.now(timezone.utc).isoformat()
-    }
+        return jsonify({
+            "mensaje": "Jugador registrado",
+            "jugador": {
+                "id": jugador_id,
+                "nombre": nombre,
+                "fecha": fecha.isoformat()
+            }
+        }), 201
 
-    jugadores.append(jugador)
-    guardar_jugadores(jugadores)
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({
+            "error": "Ese nombre ya está registrado"
+        }), 409
 
-    return jsonify({
-        "mensaje": "Jugador registrado",
-        "jugador": jugador
-    }), 201
+    except Exception:
+        app.logger.exception("Error registrando jugador")
+        return jsonify({"error": "Error registrando jugador"}), 500
+
+
+inicializar_base_datos()
 
 
 if __name__ == "__main__":
-    print("BARBOSA SERVER iniciado")
     app.run(host="0.0.0.0", port=5000, debug=False)
+
